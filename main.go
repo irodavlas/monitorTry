@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -16,6 +17,18 @@ import (
 )
 
 const (
+	UK_CURRENCY = "£"
+	FR_CURRENCY = "€"
+	DE_CURRENCY = "€"
+	PL_CURRENCY = "zł"
+)
+const (
+	UK_WEBHOOK = "https://discordapp.com/api/webhooks/1252001796361162843/5bzY987n-6-hibjcAtmJbPfZoICSfGbV6TDT_XUn_Xr7izhYxBatv4tn3RHuFxczRByZ"
+	FR_WEBHOOK = "https://discordapp.com/api/webhooks/1252276637320609803/UO43qxvtq-zJvhgjWIcE5sh8rYZNcyB8cEC1n1SHT5o8QEqA2F64gJQShg-bM-Eu3cAF"
+	DE_WEBHOOK = "https://discordapp.com/api/webhooks/1252276571931410522/elu93W1O7uqYY3kaQzaGT4xcgZhT9SPgmffjAoH_r8dlXFGNnKGfWRXD0T35CNT8klgN"
+	PL_WEBHOOK = "https://discordapp.com/api/webhooks/1252276519913525400/erbkXOsWU0QQoUqME_gbGepgqJMi5ZZywR-TcokbTUJSsEOPN5QuiT4D7JQVy1eRt1w7"
+)
+const (
 	UK_BASE_URL = "https://www.vinted.co.uk"
 	FR_BASE_URL = "https://www.vinted.fr"
 	DE_BASE_URL = "https://www.vinted.de"
@@ -24,41 +37,23 @@ const (
 
 // var session_channel chan string
 var error_channel chan string
-var product_channel chan Item
+var product_channel chan data.Item
 
-// together with the channels it would be better to have it in a struct Monitor
-var FOUND_SKU_UK []int
-
+type Monitor struct {
+	Client    Client
+	FOUND_SKU []int
+}
 type Client struct {
 	TlsClient *tls_client.HttpClient
 	url       string
+	Region    string
 }
-type Sessions struct {
-	UK_session string
-	FR_session string
-	// 34DE_session string
-	// add more
-}
+
 type Options struct {
 	settings []tls_client.HttpClientOption
 }
-type Catalog struct {
-	Items []Item `json:"items"`
-}
-type Item struct {
-	ID        int    `json:"id"`
-	Title     string `json:"title"`
-	URL       string `json:"url"`
-	Photo     Photo  `json:"photo"`
-	SizeTitle string `json:"size_title"`
-	Price     string `json:"price"`
-}
 
-type Photo struct {
-	URL string `json:"url"`
-}
-
-func NewClient(_url string) (*Client, error) {
+func NewClient(_url string, region string) (*Client, error) {
 	options := Options{
 		settings: []tls_client.HttpClientOption{
 			tls_client.WithTimeoutSeconds(15),
@@ -71,24 +66,38 @@ func NewClient(_url string) (*Client, error) {
 		return nil, err
 	}
 
-	return &Client{TlsClient: &client, url: _url}, nil
+	return &Client{TlsClient: &client, url: _url, Region: region}, nil
 }
 func main() {
 	// initializing channels
-
-	//session_channel = make(chan string)
 	error_channel = make(chan string)
-	product_channel = make(chan Item)
+	product_channel = make(chan data.Item)
+
 	//new client to fetch session header
-	clientUk, err := NewClient(UK_BASE_URL)
-	if err != nil {
-		log.Println("Error creating Client to retrive session Header: " + err.Error())
+	var monitors []*Monitor
+	urls := []string{
+		UK_BASE_URL,
+		FR_BASE_URL,
+		DE_BASE_URL,
+		PL_BASE_URL,
+	}
+	for _, url := range urls {
+		client, err := NewClient(url, url[len(url)-2:])
+		if err != nil {
+			log.Println("Error creating Client to retrive session Header: " + err.Error())
+		}
+		monitor := Monitor{
+			Client:    *client,
+			FOUND_SKU: []int{},
+		}
+		monitors = append(monitors, &monitor)
+	}
+	for _, monitor := range monitors {
+		go monitor.new_product_monitor(&monitor.Client)
 	}
 
-	//only have 1 client as for now, so reuse clientUK
 	go read_errors()
 	go read_prods()
-	go new_product_monitor(clientUk)
 
 	select {}
 
@@ -96,17 +105,38 @@ func main() {
 func read_prods() {
 	for {
 		prod := <-product_channel
-		send_webhook("https://discordapp.com/api/webhooks/1252001796361162843/5bzY987n-6-hibjcAtmJbPfZoICSfGbV6TDT_XUn_Xr7izhYxBatv4tn3RHuFxczRByZ", prod)
-		log.Println("prod	:", prod)
+
+		if prod.Region == "uk" {
+			send_webhook(UK_WEBHOOK, UK_CURRENCY, prod)
+		}
+		if prod.Region == "fr" {
+			send_webhook(FR_WEBHOOK, FR_CURRENCY, prod)
+
+		}
+		if prod.Region == "de" {
+			send_webhook(DE_WEBHOOK, DE_CURRENCY, prod)
+
+		}
+		if prod.Region == "pl" {
+			send_webhook(PL_WEBHOOK, PL_CURRENCY, prod)
+
+		}
+
 	}
 }
-func send_webhook(u string, prod Item) {
+func read_errors() {
+	for {
+		err := <-error_channel
+		log.Println("Error:", err)
+	}
+}
+func send_webhook(u string, currency string, prod data.Item) {
 	webhook := &data.Webhook{}
-	webhook.SetContent("This is a test webhook")
 
 	// Create an embed
 	embed := data.Embed{}
-	embed.SetTitle("Vinted Monitor (New Prod)")
+	var title = "Vinted Monitor (New Prod) [" + prod.Region + "]"
+	embed.SetTitle(title)
 	embed.SetColor(0x00ff00) // Green color
 	embed.SetThumbnail(prod.Photo.URL)
 	embed.SetDescription("New Product Detected ")
@@ -114,8 +144,13 @@ func send_webhook(u string, prod Item) {
 	embed.AddField("Title:", prod.Title, false)
 
 	embed.AddField("URL: ", prod.URL, false)
-	embed.AddField("Price:", prod.Price, false)
+	var s = "Price " + currency
 
+	embed.AddField(s, prod.Price, false)
+	var t = "Total price " + currency
+	embed.AddField(t, prod.TotalItemPrice, false)
+	embed.AddField("User :", prod.User.ProfileURL, false)
+	embed.SetFooter(prod.Timestamp.String(), "")
 	// Add the embed to the webhook
 	webhook.AddEmbed(embed)
 
@@ -128,15 +163,19 @@ func send_webhook(u string, prod Item) {
 		fmt.Println("Webhook sent successfully")
 	}
 }
-func new_product_monitor(client *Client) {
+func (m *Monitor) new_product_monitor(client *Client) {
 
 	for {
-		session := get_session(client)
-
-		url := "https://www.vinted.co.uk/api/v2/catalog/items?page=1&per_page=96&search_text=&catalog_ids=&order=newest_first&size_ids=&brand_ids=&status_ids=&color_ids=&material_ids="
+		session, err := get_session(client)
+		if err != nil {
+			error_channel <- "[" + m.Client.Region + "]" + "Retrying fetching session, Error occured: " + err.Error()
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		url := client.url + "/api/v2/catalog/items?page=1&per_page=96&search_text=&catalog_ids=&order=newest_first&size_ids=&brand_ids=&status_ids=&color_ids=&material_ids="
 		req, err := http.NewRequest(http.MethodGet, url, nil)
 		if err != nil {
-			error_channel <- "Retrying, Error occured: " + err.Error()
+			error_channel <- "[" + m.Client.Region + "]" + "Retrying, Error occured: " + err.Error()
 			time.Sleep(2 * time.Second)
 			continue
 		}
@@ -154,44 +193,56 @@ func new_product_monitor(client *Client) {
 
 		resp, err := (*client.TlsClient).Do(req)
 		if err != nil {
-			error_channel <- "Retrying, Error occured while firing the request: " + err.Error()
+			error_channel <- "[" + m.Client.Region + "]" + "Retrying, Error occured while firing the request: " + err.Error()
 			time.Sleep(2 * time.Second)
 			continue
 		}
 		if resp.StatusCode == 200 {
 			body, err := io.ReadAll(resp.Body)
 			if err != nil {
-				error_channel <- "Retrying, Error occured: " + err.Error()
+				error_channel <- "[" + m.Client.Region + "]" + "Retrying, Error occured: " + err.Error()
 				resp.Body.Close()
 				time.Sleep(2 * time.Second)
 				continue
 			}
-			var catalog Catalog
+			var catalog data.CatalogueItems
 			err = json.Unmarshal(body, &catalog)
+
 			if err != nil {
-				error_channel <- "Retrying, Error occured: " + err.Error()
+				error_channel <- "[" + m.Client.Region + "]" + "Retrying, Error occured: " + err.Error()
 				return
 			}
-			log.Println("Succesfully made request to products page")
+			log.Println("[" + m.Client.Region + "]" + "Succesfully made request to products page")
 
-			if len(FOUND_SKU_UK) <= 0 {
+			if len(m.FOUND_SKU) <= 0 {
 				for _, item := range catalog.Items {
-					FOUND_SKU_UK = append(FOUND_SKU_UK, item.ID)
+
+					m.FOUND_SKU = append(m.FOUND_SKU, int(item.ID))
 
 				}
-				log.Println("First iteration finished")
+				log.Println("[" + m.Client.Region + "]" + "First iteration finished")
 				continue
 			}
 			for _, item := range catalog.Items {
-				if !slices.Contains(FOUND_SKU_UK, item.ID) {
-					FOUND_SKU_UK = append(FOUND_SKU_UK, item.ID)
+				if !slices.Contains(m.FOUND_SKU, int(item.ID)) {
+
+					//append to found skus
+					m.FOUND_SKU = append(m.FOUND_SKU, int(item.ID))
+
+					//set few personalized informations
+					item.Region = m.Client.Region
+					currentTime := time.Now()
+					timestamp := currentTime.Round(time.Millisecond)
+					item.Timestamp = timestamp
+
+					//broadcast product to channel
 					product_channel <- item
-					log.Println("Found New Item with SKU: ", item.ID)
+					log.Println("["+m.Client.Region+"]"+"Found New Item with SKU: ", item.ID)
 				}
 			}
 
 		} else {
-			error_channel <- fmt.Sprintf("Status Code [%d]", resp.StatusCode)
+			error_channel <- fmt.Sprintf("["+m.Client.Region+"]"+"Status Code [%d]", resp.StatusCode)
 			time.Sleep(2 * time.Second)
 
 			continue
@@ -200,18 +251,12 @@ func new_product_monitor(client *Client) {
 	}
 
 }
-func read_errors() {
-	for {
-		err := <-error_channel
-		log.Println("Error:", err)
-	}
-}
-func get_session(client *Client) string {
+
+func get_session(client *Client) (string, error) {
 
 	req, err := http.NewRequest(http.MethodHead, client.url, nil)
 	if err != nil {
-		error_channel <- "Retrying fetching session, Error occured: " + err.Error()
-
+		return "", err
 	}
 
 	req.Header = http.Header{}
@@ -232,22 +277,21 @@ func get_session(client *Client) string {
 
 	resp, err := (*client.TlsClient).Do(req)
 	if err != nil {
-		error_channel <- "Retrying fetching session, Error occured: " + err.Error()
-
+		return "", err
 	}
 
-	resp.Body.Close()
+	defer resp.Body.Close()
 
 	cookie := resp.Header["Set-Cookie"]
 	session := extractSessionCookie(cookie)
 	if session == "" {
-		error_channel <- "No valid session cookie found"
+		return "", errors.New("no valid session cookie found")
 
 	}
 
 	log.Println("Succesfully fetched Session cookie")
 
-	return session
+	return session, nil
 
 }
 
@@ -257,6 +301,5 @@ func extractSessionCookie(cookies []string) string {
 			return strings.Split(strings.Split(cookie, "_vinted_fr_session=")[1], ";")[0]
 		}
 	}
-	error_channel <- "Couldn't find Cookie!"
 	return ""
 }
